@@ -1225,7 +1225,7 @@ function renderInterviewShell(a){
 }
 function initInterviewDemo(){
   IV = { step:1, job:null, role:'hr', bank:[], cur:0, sec:90, phase:'idle', timer:null, done:false, inFollowup:false, pendingFollowup:null,
-         qAudios:{}, replyCache:{ready:false,busy:false,text:'',audio:''}, followCache:{ready:false,busy:false,audio:''}, autoPlay:false };
+         qAudios:{}, replyCache:{ready:false,busy:false,text:'',audio:''}, followCache:{ready:false,busy:false,audio:''}, followupAudio:{ready:false,busy:false,audio:''}, autoPlay:false };
   stopAvatar();
   for(let i=1;i<=4;i++) document.getElementById('ivS'+i).classList.toggle('on', i===1);
   ivRenderJob();
@@ -1326,6 +1326,7 @@ function ivRenderInterview(){
   IV.lastFollowAnswer = '';
   IV.replyCache = { ready:false, busy:false, text:'', audio:'' };
   IV.followCache = { ready:false, busy:false, audio:'' };
+  IV.followupAudio = { ready:false, busy:false, audio:'' };
   IV.autoPlay = false;
   ivLog('ai', '（面试开始）' + IV.job.title + '您好，我是今天负责面试的「智聘面试官」，我们先从第一个问题开始。');
   renderIvCtrl();
@@ -1346,6 +1347,8 @@ function renderIvCtrl(){
   }else if(IV.phase==='replying' || IV.phase==='playing_r'){
     const prep = (IV.inFollowup ? (IV.followCache.busy ? '（准备中）' : '') : (IV.replyCache.busy ? '（准备中）' : ''));
     h += '<button class="iv-btn primary" onclick="ivPlayReply()"' + (IV.phase==='playing_r'?'disabled':'') + '>' + (IV.inFollowup ? '▶ 播放面试官收尾' : '▶ 播放面试官回应') + prep + '</button>';
+  }else if(IV.phase==='followup_q'){
+    h += '<button class="iv-btn" disabled>面试官正在追问…</button>';
   }else if(IV.phase==='followup'){
     h += '<div class="iv-followup"><b>面试官追问：</b>' + esc(IV.pendingFollowup || '') + '</div>' +
          '<button class="iv-btn primary" onclick="ivStartAnswer()">▶ 开始作答（回答追问 · 90 秒）</button>';
@@ -1541,6 +1544,7 @@ function ivPrefetchReply(){
   // 首轮：LLM 生成回应 → TTS 合成，全部后台完成
   if(!ivCount()){ IV.replyCache = { ready:false, busy:false, text:'', audio:'' }; return; }
   IV.replyCache = { ready:false, busy:true, text:'', audio:'' };
+  IV.followupAudio = { ready:false, busy:false, audio:'' };
   ivLlmReply().then(function(res){
     if(!res.reply) res.reply = IV.job.aiReply[IV.cur];
     IV.pendingFollowup = res.followup || '';   // 暂存追问，回应播放完后再呈现
@@ -1548,6 +1552,15 @@ function ivPrefetchReply(){
     return ivCall('/tts', { text: res.reply, voiceType: ivVoiceType() }).then(function(d){
       IV.replyCache = { ready:true, busy:false, text: res.reply, audio: d.audioBase64 };
       ivReplyReadyUi();
+      if(IV.pendingFollowup){
+        // 同时预合成追问语音：回应播完即自动播报，零等待
+        IV.followupAudio = { ready:false, busy:true, audio:'' };
+        ivCall('/tts', { text: IV.pendingFollowup, voiceType: ivVoiceType() }).then(function(fd){
+          IV.followupAudio = { ready:true, busy:false, audio: fd.audioBase64 };
+        }).catch(function(){
+          IV.followupAudio = { ready:false, busy:false, audio:'' };
+        });
+      }
     });
   }).catch(function(){
     IV.replyCache = { ready:false, busy:false, text:'', audio:'' };
@@ -1643,13 +1656,12 @@ function ivPlayReply(){
 }
 function ivReplyDone(){
   if(IV.phase!=='playing_r') return;
-  // 首轮回应播放完：若 AI 给出了追问且本题尚未追问过 → 进入追问待答
+  // 首轮回应播放完：若 AI 给出了追问且本题尚未追问过 → 自动播报追问语音（无需点击）
   if(!IV.inFollowup && IV.pendingFollowup){
-    IV.phase = 'followup';
     IV.inFollowup = true;
-    ivLog('ai', '追问：' + IV.pendingFollowup);
-    setIvState('面试官追问，请作答（90 秒）');
+    IV.phase = 'followup_q';
     renderIvCtrl();
+    ivPlayFollowupQ();
     return;
   }
   // 收尾/无追问：本题完成
@@ -1658,6 +1670,64 @@ function ivReplyDone(){
   const last = IV.cur >= IV.bank.length-1;
   setIvState(last ? '面试结束，可查看报告' : '本题完成');
   renderIvCtrl();
+}
+/* 自动播报追问：先语音（打字机同步文本），播完进入可作答状态 */
+function ivPlayFollowupQ(){
+  const text = '追问：' + (IV.pendingFollowup || '');
+  const play = function(b64){
+    setIvState('面试官正在追问，粒子随真实声音跳动…');
+    ivTypeLog('ai', text, estDur(text));
+    playRealAudio(b64, function(){
+      if(IV.phase!=='followup_q') return;
+      IV.phase = 'followup';
+      setIvState('面试官追问，请作答（90 秒）');
+      renderIvCtrl();
+    });
+  };
+  const c = IV.followupAudio;
+  if(ivCount() && c && c.ready){ play(c.audio); return; }
+  if(ivCount() && c && c.busy){
+    // 预取合成中：等待完成后自动播放（上限 20 秒）
+    setIvState('面试官正在组织追问…');
+    const t0 = Date.now();
+    const timer = setInterval(function(){
+      if(IV.followupAudio && IV.followupAudio.ready){
+        clearInterval(timer);
+        if(IV.phase==='followup_q') play(IV.followupAudio.audio);
+      } else if(!IV.followupAudio || !IV.followupAudio.busy || Date.now()-t0 > 20000){
+        clearInterval(timer);
+        if(IV.phase==='followup_q') ivPlayFollowupQ();   // 失败/超时：现场合成兜底
+      }
+    }, 300);
+    return;
+  }
+  // 无缓存：现场合成
+  if(ivCount()){
+    setIvState('面试官正在准备追问语音…');
+    ivCall('/tts', { text: IV.pendingFollowup, voiceType: ivVoiceType() }).then(function(d){
+      if(IV.phase!=='followup_q') return;
+      IV.followupAudio = { ready:true, busy:false, audio: d.audioBase64 };
+      play(d.audioBase64);
+    }).catch(function(e){
+      toast('语音服务暂时不可用：' + e.message);
+      if(IV.phase!=='followup_q') return;
+      ivTypeLog('ai', text, estDur(text));
+      playVoice(2600, function(){
+        if(IV.phase!=='followup_q') return;
+        IV.phase = 'followup';
+        setIvState('面试官追问，请作答（90 秒）');
+        renderIvCtrl();
+      });
+    });
+  } else {
+    ivTypeLog('ai', text, estDur(text));
+    playVoice(2600, function(){
+      if(IV.phase!=='followup_q') return;
+      IV.phase = 'followup';
+      setIvState('面试官追问，请作答（90 秒）');
+      renderIvCtrl();
+    });
+  }
 }
 function ivLlmBase(){
   const j = IV.job;
@@ -1740,6 +1810,7 @@ function ivNextQ(){
   IV.lastFollowAnswer = '';
   IV.replyCache = { ready:false, busy:false, text:'', audio:'' };
   IV.followCache = { ready:false, busy:false, audio:'' };
+  IV.followupAudio = { ready:false, busy:false, audio:'' };
   IV.autoPlay = false;
   document.querySelector('.iv-qnum').textContent = '第 ' + (IV.cur+1) + ' / ' + IV.bank.length + ' 题';
   setIvState('面试官就绪，点击播放下一题');
